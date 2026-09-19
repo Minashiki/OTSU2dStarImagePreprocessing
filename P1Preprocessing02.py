@@ -1,76 +1,121 @@
-import os
-import warnings
-import cv2
-import pandas as pd
+import argparse
 import csv
+from dataclasses import asdict, replace
+import glob
+import hashlib
+import json
+import os
+import struct
+import time
+import warnings
+
+import cv2
+from astropy.io import fits
 from PIL import Image
 import numpy as np
-import hashlib
-import struct
-from UtilityFunction.ComputeMeanVector import *
-from UtilityFunction.calculate_centroid import *
-from UtilityFunction.CalculatePrecisionRecall import calculate_precision_recall, calculate_precision_recall_fits
 
-'''FITS真实星图用的'''
-
-FITS = True
-image_path = "JPEGImages/Simu_0.779_-1.3433_-0.99016.jpg"
-tag_img_path = "SegmentationClass/Simu_0.779_-1.3433_-0.99016.png"
+from UtilityFunction.calculate_centroid import calculate_grayscale_centroid
+from SpaceStarOtsu import (
+    SpaceOtsuConfig,
+    apply_float_threshold,
+    build_binned_2d_histogram,
+    choose_histogram_upper,
+    compare_searches,
+    connected_component_metrics,
+    estimate_persistent_bad_pixels,
+    neighborhood_mean,
+    replace_bad_pixels,
+    restore_unsigned_int16,
+    robust_background,
+    save_histogram_2d,
+    save_histogram_3d_safe,
+)
 
 FITS_PATH = "rst19\\rst19\\20260330163205413_9901.fits"
-fits_num = "01"
-star_num = str(int(fits_num))
-TAG_FITS_PATH = "20240306204703518_059051_01_L/每张星图识别出的星点/starnum"+star_num+".csv"
-fits_name = "note_fits" + fits_num
-save_dir = "rst19\\" + fits_name
-
-save_dir_centroids = save_dir + "/Centroid_Top"
+save_dir = "rst19\\note_fits01"
 TOP_NUM = 5000
-PEAK_TRANSFORM_MIN = 7
-PEAK_TRANSFORM_MAX = 30
-S_INIT = 7
-T_INIT = 30
-os.makedirs(save_dir, exist_ok=True)
-def load_fits_float32(fits_path, hdu_index=0, memmap=False):
-    """
-    读取 FITS 主图像为 float32，并给出稳健统计，捕获“可能截断”警告。
-    """
-    with warnings.catch_warnings(record=True) as wlist:
-        warnings.simplefilter("always")
-        hdul = fits.open(fits_path, memmap=memmap)
-        try:
-            data = hdul[hdu_index].data
-            header = hdul[hdu_index].header
-        finally:
-            hdul.close()
 
-    if data is None:
-        raise ValueError(f"HDU[{hdu_index}] 没有图像数据")
 
-    img = np.array(data, dtype=np.float32, copy=True)
-
-    # 记录 warning（特别关注截断）
-    warn_msgs = [str(w.message) for w in wlist]
-    truncated = any("may have been truncated" in m for m in warn_msgs)
-
-    # 稳健统计（分位数比 min/max 更有意义）
-    p = np.percentile(img[np.isfinite(img)], [0.1, 1, 50, 99, 99.9])
-    stats = {
-        "shape": img.shape,
-        "dtype": str(img.dtype),
-        "min": float(np.min(img)),
-        "max": float(np.max(img)),
-        "median": float(np.median(img)),
-        "std": float(np.std(img)),
-        "p0.1": float(p[0]),
-        "p1": float(p[1]),
-        "p50": float(p[2]),
-        "p99": float(p[3]),
-        "p99.9": float(p[4]),
-        "truncated_warning": truncated,
-        "warnings": warn_msgs,
+def _fits_length_status(fits_path, data_offset, shape, bitpix):
+    """Distinguish missing FITS block padding from an incomplete pixel payload."""
+    payload_bytes = int(np.prod(shape, dtype=np.int64)) * (abs(int(bitpix)) // 8)
+    required_length = int(data_offset) + payload_bytes
+    padded_length = int(data_offset) + ((payload_bytes + 2879) // 2880) * 2880
+    actual_length = os.path.getsize(fits_path)
+    if actual_length < required_length:
+        status = "pixel_data_truncated"
+    elif actual_length < padded_length:
+        status = "pixel_data_complete_padding_missing"
+    else:
+        status = "complete"
+    return {
+        "status": status,
+        "actual_length": actual_length,
+        "required_pixel_length": required_length,
+        "expected_padded_length": padded_length,
+        "missing_pixel_bytes": max(0, required_length - actual_length),
+        "missing_padding_bytes": max(0, padded_length - actual_length),
     }
-    return img, header, stats
+
+
+def load_space_fits(fits_path, config=None, hdu_index=0):
+    """Load one FITS frame and restore this camera's unsigned 16-bit convention."""
+    config = config or SpaceOtsuConfig()
+    with warnings.catch_warnings(record=True) as warning_list:
+        warnings.simplefilter("always")
+        with fits.open(fits_path, memmap=False) as hdul:
+            hdu = hdul[hdu_index]
+            if hdu.data is None:
+                raise ValueError(f"HDU[{hdu_index}] 没有图像数据")
+            header = hdu.header.copy()
+            file_info = hdul.fileinfo(hdu_index) or {}
+            signed = np.array(hdu.data, copy=True)
+
+    if signed.ndim != 2:
+        raise ValueError(f"只支持二维 FITS 图像，实际 shape={signed.shape}")
+    data_offset = file_info.get("datLoc")
+    if data_offset is None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            data_offset = len(header.tostring())
+    length_status = _fits_length_status(
+        fits_path,
+        data_offset,
+        signed.shape,
+        header.get("BITPIX", signed.dtype.itemsize * 8),
+    )
+    if length_status["status"] == "pixel_data_truncated":
+        raise OSError(
+            f"FITS 像素数据不完整，缺少 {length_status['missing_pixel_bytes']} 字节: {fits_path}"
+        )
+
+    restored, was_reinterpreted = restore_unsigned_int16(
+        signed,
+        header.get("BZERO", 0),
+        enabled=config.reinterpret_unsigned,
+    )
+    restored_f32 = np.asarray(restored, dtype=np.float32)
+    finite = restored_f32[np.isfinite(restored_f32)]
+    percentiles = np.percentile(finite, [0.1, 1, 50, 99, 99.9])
+    stats = {
+        "shape": list(restored_f32.shape),
+        "source_dtype": str(signed.dtype),
+        "working_dtype": str(restored_f32.dtype),
+        "unsigned_reinterpreted": bool(was_reinterpreted),
+        "min": float(finite.min()),
+        "max": float(finite.max()),
+        "median": float(np.median(finite)),
+        "std": float(np.std(finite)),
+        "p0.1": float(percentiles[0]),
+        "p1": float(percentiles[1]),
+        "p50": float(percentiles[2]),
+        "p99": float(percentiles[3]),
+        "p99.9": float(percentiles[4]),
+        "signed_negative_pixels": int(np.count_nonzero(signed < 0)),
+        "fits_length": length_status,
+        "warnings": [str(item.message) for item in warning_list],
+    }
+    return signed, restored_f32, header, stats
 
 def save_float_as_png_uint16(img_f32, save_path, lo_q=0.1, hi_q=99.9):
     finite = img_f32[np.isfinite(img_f32)]
@@ -79,196 +124,19 @@ def save_float_as_png_uint16(img_f32, save_path, lo_q=0.1, hi_q=99.9):
     x = (x - lo) / (hi - lo + 1e-6)
     x16 = (x * 65535.0).astype(np.uint16)
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    Image.fromarray(x16, mode="I;16").save(save_path)
+    Image.fromarray(x16).save(save_path)
 
-def median_filter_3x3(image):
-    """
-    3×3中值滤波（OpenCV API实现）
-    :param image: 输入图像（numpy数组，支持灰度图/彩色图）
-    :return: 滤波后的图像
-    """
-    if image is None:
-        raise ValueError("输入图像为空，请检查路径或图像完整性")
-    # ksize=3：3×3滤波核，OpenCV自动处理边界（默认填充）
-    return cv2.medianBlur(image, ksize=3)
+def save_centroids_to_csv(centroids, output_dir):
+    """Save ``(x, y)`` centroid pairs as NumPy and CSV files."""
+    save_path_npy = os.path.join(output_dir, "centroids.npy")
+    save_path_csv = os.path.join(output_dir, "centroids.csv")
 
-def gaussian_filter_3x3(image, sigmaX=1.0):
-    """
-    3×3高斯滤波（OpenCV API实现）
-    :param image: 输入图像（numpy数组，支持灰度图/彩色图）
-    :param sigmaX: X方向标准差（控制模糊程度，默认1.0，>0时自动计算Y方向标准差）
-    :return: 滤波后的图像
-    """
-    if image is None:
-        raise ValueError("输入图像为空，请检查路径或图像完整性")
-    # ksize=(3,3)：3×3滤波核，sigmaY默认=sigmaX
-    return cv2.GaussianBlur(image, ksize=(3, 3), sigmaX=sigmaX, sigmaY=sigmaX)
-
-def compute_kernel(img):
-    filtered_image = cv2.boxFilter(
-        src=img,
-        ddepth=-1,  # 输出图像深度与输入一致（-1表示自动匹配）
-        ksize=(3, 3),
-        normalize=True,
-        borderType=cv2.BORDER_DEFAULT
-    )
-    return filtered_image
-
-def test(img, f_img, s, j):
-    H,W = img.shape
-    result = np.zeros(shape=(H,W), dtype=np.uint8)
-    for h in range(H):
-        for w in range(W):
-            if img[h][w] > s and f_img[h][w] > j:
-                result[h][w] = 255
-    print(result.dtype)
-    return result
-
-
-def vs(tag, re, dot_size = 0,
-                                    inplace: bool = False) -> np.ndarray:
-    """
-    在uint8类型的NumPy数组（源图像）中寻找非零像素，在目标NumPy数组（目标图像）对应位置绘制红色点
-    :param tag: 源图像的NumPy数组（uint8，灰度图shape=(H,W) / 彩色图shape=(H,W,3)），用于寻找非零像素
-    :param re: 目标图像的NumPy数组（灰度图/彩色图均可），用于绘制红色点
-    :param dot_size: 红色点的大小（默认2像素，半径）
-    :param inplace: 是否在目标数组原地修改（默认False：复制后绘制，不影响原数组）
-    :return: 绘制红色点后的目标图像NumPy数组
-    """
-
-    target_processed = re.copy() if not inplace else re
-    if len(target_processed.shape) == 2:  # 灰度图 -> 彩色图（BGR格式）
-        target_processed = cv2.cvtColor(target_processed, cv2.COLOR_GRAY2BGR)
-
-    nonzero_mask = tag > 0
-
-    # 获取非零像素的坐标（y: 行索引，x: 列索引）
-    nonzero_y, nonzero_x = np.where(nonzero_mask)
-
-    # 4. 在目标数组对应位置绘制红色点（OpenCV BGR格式：红色=(0,0,255)）
-    red_color = (0, 0, 255)
-    thickness = -1  # 填充式绘制（实心点）
-
-    # 批量绘制（比循环更高效，尤其非零像素多时）
-    for x, y in zip(nonzero_x, nonzero_y):
-        cv2.circle(
-            img=target_processed,
-            center=(x, y),  # OpenCV绘图坐标：(列, 行) = (x, y)
-            radius=dot_size,
-            color=red_color,
-            thickness=thickness
-        )
-
-    return target_processed
-
-
-def peak_suppress_transform(img, g_min, g_max, inplace=False):
-    """
-    削峰变换（对应论文方法）:
-        灰度 < g_min 的像素统一压到 g_min
-        灰度 > g_max 的像素统一压到 g_max
-        中间 [g_min, g_max] 不变
-    用于让暗弱星点 + 背景噪声的双峰落在 [g_min, g_max] 的中间区域，然后在这个
-    区间上做二维 Otsu 寻找最优阈值。:contentReference[oaicite:1]{index=1}
-
-    参数
-    ----
-    img : np.ndarray, 灰度图，任意数值类型
-    g_min : float/int, 削峰下界
-    g_max : float/int, 削峰上界
-    inplace : bool, True 则在原数组上改，False 则返回副本
-
-    返回
-    ----
-    out : np.ndarray, 与 img 同 dtype
-    """
-    if not isinstance(img, np.ndarray):
-        raise TypeError("img 必须是 numpy.ndarray")
-
-    if g_min >= g_max:
-        raise ValueError("g_min 必须小于 g_max")
-
-    out = img if inplace else img.copy()
-
-    # 为了避免整数溢出，用 float 计算再转回原类型
-    out_f = out.astype(np.float32)
-
-    out_f[out_f < g_min] = g_min
-    out_f[out_f > g_max] = g_max
-
-    return out_f.astype(img.dtype)
-
-def rescale_gray(tag: np.ndarray, new_min: float, new_max: float, dtype=None):
-    """
-    将灰度值范围为 [0, 1] 的图像线性映射到 [new_min, new_max]
-
-    Parameters
-    ----------
-    tag : np.ndarray
-        输入灰度图，要求数值范围在 [0, 1]
-    new_min : float
-        目标最小灰度值
-    new_max : float
-        目标最大灰度值
-    dtype : np.dtype or None
-        输出数据类型，例如 np.uint8、np.float32
-        若为 None，则保持浮点类型
-
-    Returns
-    -------
-    np.ndarray
-        映射后的灰度图
-    """
-    if new_max <= new_min:
-        raise ValueError("new_max 必须大于 new_min")
-
-    # 线性映射
-    out = tag * (new_max - new_min) + new_min
-
-    # 可选类型转换
-    if dtype is not None:
-        out = out.astype(dtype)
-
-    return out
-
-def mask_to_star_csv(mask, intensity, csv_path, min_area=3, connectivity=8):
-    mask_bin = (mask > 0).astype(np.uint8)
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask_bin, connectivity=connectivity)
-
-    stars = []
-    for label in range(1, num_labels):
-        area = stats[label, cv2.CC_STAT_AREA]
-        if area < min_area:
-            continue
-        cx, cy = centroids[label]
-        pts = intensity[labels == label]
-        flux = float(pts.sum())
-        peak = float(pts.max()) if pts.size else 0.0
-
-        stars.append({"id": len(stars)+1, "x": float(cx), "y": float(cy),
-                      "area": int(area), "flux": flux, "peak": peak})
-
-    df = pd.DataFrame(stars).sort_values("flux", ascending=False).reset_index(drop=True)
-    df.to_csv(csv_path, index=False, float_format="%.6f")
-    return df
-
-def save_centroids_to_csv(centroids):
-    """
-    保存灰度质心到CSV文件
-    :param centroids: 质心数据，格式为 [(x, y), ...]
-    :param save_path: 保存路径
-    """
-    save_path_npy = os.path.join(save_dir_centroids, "centroids.npy")
-    save_path_csv = os.path.join(save_dir_centroids, "centroids.csv")
-
-    # 确保文件夹存在，如果不存在则创建
-    os.makedirs(save_dir_centroids, exist_ok=True)
-
-    # 保存为npy文件（适用于快速加载）
+    os.makedirs(output_dir, exist_ok=True)
     np.save(save_path_npy, centroids)
-    # 保存到CSV文件
-    df_centroids = pd.DataFrame(centroids, columns=['centroid_x', 'centroid_y'])
-    df_centroids.to_csv(save_path_csv, index=False)
+    with open(save_path_csv, "w", newline="", encoding="utf-8-sig") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(["centroid_x", "centroid_y"])
+        writer.writerows(centroids)
 
     print(f"质心数据已保存到：{save_path_npy} 和 {save_path_csv}")
 
@@ -277,203 +145,506 @@ def centroid_hash_u64(x_f4: np.float32, y_f4: np.float32) -> np.uint64:
     d = hashlib.blake2b(b, digest_size=8).digest()  # 8 bytes = 64-bit
     return np.frombuffer(d, dtype=np.uint64)[0]
 
-def main_p1():
-    # img = Image.open(image_path)
-    # img = np.array(img)
-    if FITS_PATH is not None:
-        img, header, stats = load_fits_float32(FITS_PATH)
+def _save_centroid_artifacts(grayscale_centroids, output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+    centroids = [(star["centroid_x"], star["centroid_y"]) for star in grayscale_centroids]
+    save_centroids_to_csv(centroids, output_dir)
 
-        print(stats)
-        if stats["truncated_warning"]:
-            print("注意：FITS 可能截断，建议重新拷贝/重新导出该文件。")
-
-    raw_img = img.copy()
-
-    print(f"图像形状: {img.shape}")
-    print(f"像素统计: min={img.min():.1f}, max={img.max():.1f}, median={np.median(img):.1f}, std={np.std(img):.1f}")
-    # img = np.array(img)
-
-    print(f"图像尺寸: {img.shape}, 最小值={img.min():.1f}, 最大值={img.max():.1f}", {img.dtype})
-    img_median = cv2.medianBlur(img, ksize=3)
-    img_gaussian = cv2.GaussianBlur(img_median, ksize=(5, 5), sigmaX=1.0, sigmaY=1.0)
-    img = img_gaussian.copy()
-    print(f"滤波后，图像尺寸: {img.shape}, 最小值={img.min():.1f}, 最大值={img.max():.1f}", {img.dtype})
-    np.save(os.path.join(save_dir, "img_gaussian.npy"), img_gaussian)
-    save_path = os.path.join(save_dir, "img_gaussian.png")
-    raw_img_save_path = os.path.join(save_dir, "raw_img.png")
-    if FITS == False:
-        Image.fromarray(img_gaussian).save(save_path)
-    else:
-        save_float_as_png_uint16(img_gaussian, save_path)
-        save_float_as_png_uint16(raw_img, raw_img_save_path)
-    # img = raw_img.copy()
-
-    # cv2.imshow("PreImage", img)
-    # cv2.imshow("3x3 Median Filter", img_median)
-    # cv2.imshow("3x3 Gaussian Filter (sigma=1.0)", img_gaussian)
-
-    # img = peak_suppress_transform(img, g_min=PEAK_TRANSFORM_MIN, g_max=PEAK_TRANSFORM_MAX).astype(np.float32)
-    img_show = img.copy()
-    I_D = img.copy()
-    I_D_raw = img_gaussian.astype(np.float32)  # 滤波后但未削峰
-    np.save(os.path.join(save_dir, "I_D_raw.npy"), I_D_raw)
-    print(f"峰值变换后，图像尺寸: {img.shape}, 最小值={img.min():.1f}, 最大值={img.max():.1f}", {img.dtype})
-
-
-    p_ij = compute_2d_hist(img)
-    visualize_3d_hist(p_ij, save_path=save_dir)
-    # 假设已经得到二维直方图 p_ij
-    P = compute_prefix_sum(p_ij)
-
-    s = S_INIT
-    t = T_INIT
-    L = p_ij.shape[0]  # 而不是 data_max+1
-
-    W0 = get_W0(P, s, t)
-    W1 = get_W1(P, L, s, t)
-
-    print("W0 =", W0)
-    print("W1 =", W1)
-    print("W0 + W1 =", W0 + W1)  # 接近 1（平原区假设忽略）
-
-    # Step 2~4：搜索最佳阈值
-    s_star, t_star, score = otsu_2d_find_thresholds(p_ij)
-    print("最佳 阈值 s、t =", s_star, t_star)
-    print("最大类间散度 =", score)
-
-    # Step 5：二值化
-    mask_u8 = apply_2d_otsu_threshold(I_D, s_star, t_star)  # 用 I_D 更语义清晰
-
-    # === 统一 mask 为 bool，并保存 ===
-
-    mask_bool = (mask_u8 > 0)
-    mask01 = mask_bool.astype(np.uint8)  # 0/1 uint8
-    print(f"mask_u8: min={mask_u8.min()}, max={mask_u8.max()}, dtype={mask_u8.dtype}")
-    print("mask pixels:", int(mask_bool.sum()))
-
-    Image.fromarray(mask_u8).save(os.path.join(save_dir, "mask.png"))
-
-
-    # 显示结果
-    cv2.imshow("2D Otsu mask", mask_u8)
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
-
-    grayscale_centroids = calculate_grayscale_centroid(mask_bool, raw_img)
-    # for star in grayscale_centroids:
-    #     print(f"Star {star['label']} - Centroid: ({star['centroid_x']}, {star['centroid_y']})")
-
-    if FITS == False:
-        # png图像计算精确率和召回率
-        tag_img = Image.open(tag_img_path)
-        tag_img_array = np.array(tag_img.convert('L'))
-        tag_mask_bool = tag_img_array > 0
-        geometric_centroids = calculate_geometric_centroid(tag_mask_bool)
-        # 计算欧氏距离
-        distances = match_centroids(geometric_centroids, grayscale_centroids)
-
-        # 输出欧氏距离
-        for dist in distances:
-            if dist["distance"] is not None:
-                print(f"Star {dist['label']} - Euclidean Distance: {dist['distance']:.2f}")
-            else:
-                print(f"Star {dist['label']} - Missing in grayscale centroids.")
-
-        precision, recall = calculate_precision_recall(distances, geometric_centroids, grayscale_centroids)
-        print(f"Precision: {precision:.2f}")
-        print(f"Recall: {recall:.2f}")
-    # elif FITS == True:
-    #     # 将已知星点作为标准，将计算精确率和召回率
-    #     geometric_centroids = load_geometric_centroids_from_tag_csv(TAG_FITS_PATH)
-    #     distances = match_centroids_fits(geometric_centroids, grayscale_centroids)
-
-    #     for dist in distances:
-    #         if dist["distance"] is not None:
-    #             print(
-    #                 f"Star {dist['label']} - Euclidean Distance: {dist['distance']:.2f} (matched_gray={dist.get('matched_gray_label')})")
-    #         else:
-    #             print(f"Star {dist['label']} - Missing / no close match in grayscale centroids.")
-
-    #     precision, recall = calculate_precision_recall_fits(distances, geometric_centroids, grayscale_centroids)
-    #     print(f"FITS_Precision: {precision:.2f}")
-    #     print(f"FITS_Recall: {recall:.2f}")
-
-    #     pd.DataFrame(distances).to_csv(os.path.join(save_dir, "centroid_match_fits.csv"), index=False)
-
-    centroids = [(star['centroid_x'], star['centroid_y']) for star in grayscale_centroids]
-    save_centroids_to_csv(centroids)
-
-    os.makedirs(save_dir_centroids, exist_ok=True)
-
-    # =========================
-    # 1) 保存全量灰度质心（按 flux 已从大到小排好）
-    # =========================
-    allN = len(grayscale_centroids)
+    all_count = len(grayscale_centroids)
     all_hash = np.empty(
-        (allN,),
-        dtype=[
-            ("hash", "u8"),
-            ("x", "f4"),
-            ("y", "f4"),
-            ("flux", "f8"),
-            ("area", "i4"),
-        ]
+        (all_count,),
+        dtype=[("hash", "u8"), ("x", "f4"), ("y", "f4"), ("flux", "f8"), ("area", "i4")],
     )
-
     all_x = np.array([star["centroid_x"] for star in grayscale_centroids], dtype=np.float32)
     all_y = np.array([star["centroid_y"] for star in grayscale_centroids], dtype=np.float32)
     all_flux = np.array([star["flux"] for star in grayscale_centroids], dtype=np.float64)
     all_area = np.array([star["area"] for star in grayscale_centroids], dtype=np.int32)
-
-    all_hash["x"] = all_x
-    all_hash["y"] = all_y
-    all_hash["flux"] = all_flux
-    all_hash["area"] = all_area
+    all_hash["x"], all_hash["y"] = all_x, all_y
+    all_hash["flux"], all_hash["area"] = all_flux, all_area
     all_hash["hash"] = np.array(
-        [centroid_hash_u64(x, y) for x, y in zip(all_x, all_y)],
-        dtype=np.uint64
+        [centroid_hash_u64(x, y) for x, y in zip(all_x, all_y)], dtype=np.uint64
     )
+    np.savez_compressed(os.path.join(output_dir, "centroid_all.npz"), all_hash=all_hash)
 
-    np.savez_compressed(
-        os.path.join(save_dir_centroids, "centroid_all.npz"),
-        all_hash=all_hash
-    )
-    # 同时保存 centroid_all.csv
-    csv_path_all = os.path.join(save_dir_centroids, "centroid_all.csv")
-    with open(csv_path_all, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.writer(f)
+    with open(os.path.join(output_dir, "centroid_all.csv"), "w", newline="", encoding="utf-8-sig") as stream:
+        writer = csv.writer(stream)
         writer.writerow(["rank", "hash", "x", "y", "flux", "area"])
-        for i in range(allN):
-            writer.writerow([
-                i + 1,
-                int(all_hash["hash"][i]),
-                float(all_hash["x"][i]),
-                float(all_hash["y"][i]),
-                float(all_hash["flux"][i]),
-                int(all_hash["area"][i]),
-            ])
+        for index in range(all_count):
+            writer.writerow(
+                [
+                    index + 1,
+                    int(all_hash["hash"][index]),
+                    float(all_hash["x"][index]),
+                    float(all_hash["y"][index]),
+                    float(all_hash["flux"][index]),
+                    int(all_hash["area"][index]),
+                ]
+            )
 
-    # =========================
-    # 2) 保存前 TOP_NUM 个（兼容你原来的流程）
-    # =========================
-    topN = min(TOP_NUM, allN)
+    top_count = min(TOP_NUM, all_count)
+    top_hash = np.empty((top_count,), dtype=[("hash", "u8"), ("x", "f4"), ("y", "f4")])
+    top_hash["x"], top_hash["y"] = all_x[:top_count], all_y[:top_count]
+    top_hash["hash"] = all_hash["hash"][:top_count]
+    np.savez_compressed(os.path.join(output_dir, "centroid_top.npz"), top_hash=top_hash)
 
-    top_hash = np.empty(
-        (topN,),
-        dtype=[("hash", "u8"), ("x", "f4"), ("y", "f4")]
+
+def _save_mask_overlay(image, mask_u8, save_path):
+    finite = image[np.isfinite(image)]
+    lo, hi = np.percentile(finite, [1.0, 99.9])
+    display = np.clip((image - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
+    display_u8 = (display * 255).astype(np.uint8)
+    overlay = cv2.cvtColor(display_u8, cv2.COLOR_GRAY2BGR)
+    contours, _ = cv2.findContours((mask_u8 > 0).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(overlay, contours, -1, (0, 0, 255), 1)
+    cv2.imwrite(save_path, overlay)
+
+
+def _remove_stale_search_artifacts(output_dir, preset_name, selected_search):
+    """Remove method-specific images left by an earlier run with another search."""
+    other_search = "nine_grid" if selected_search == "exact" else "exact"
+    stale_names = (
+        f"mask_{preset_name}_{other_search}.png",
+        f"overlay_{preset_name}_{other_search}.png",
+        f"mask_{preset_name}_difference.png",
     )
+    for name in stale_names:
+        path = os.path.join(output_dir, name)
+        if os.path.isfile(path):
+            os.remove(path)
 
-    top_hash["x"] = all_x[:topN]
-    top_hash["y"] = all_y[:topN]
-    top_hash["hash"] = all_hash["hash"][:topN]
 
-    np.savez_compressed(
-        os.path.join(save_dir_centroids, "centroid_top.npz"),
-        top_hash=top_hash
+def _preset_to_dict(result, component_stats):
+    return {
+        "percentile": result.percentile,
+        "upper": result.upper,
+        "valid_pixels": result.valid_pixels,
+        "excluded_pixels": result.excluded_pixels,
+        "exact": asdict(result.exact),
+        "nine_grid": asdict(result.nine_grid),
+        "score_gap": result.score_gap,
+        "bin_distance": result.bin_distance,
+        "nine_grid_unstable": result.nine_grid_unstable,
+        "exact_threshold_s": result.exact_threshold_s,
+        "exact_threshold_t": result.exact_threshold_t,
+        "nine_threshold_s": result.nine_threshold_s,
+        "nine_threshold_t": result.nine_threshold_t,
+        "components": component_stats,
+    }
+
+
+def _normalize_search_method(search_method):
+    normalized = str(search_method).strip().lower().replace("-", "_")
+    if normalized not in {"exact", "nine_grid"}:
+        raise ValueError("search_method 必须是 'exact' 或 'nine-grid'")
+    return normalized
+
+
+def _validate_preset(preset, config):
+    normalized = str(preset).strip().lower()
+    if normalized not in config.preset_percentiles:
+        choices = ", ".join(config.preset_percentiles)
+        raise ValueError(f"preset 必须是以下之一: {choices}")
+    return normalized
+
+
+def _process_one(
+    fits_path,
+    output_dir,
+    config,
+    bad_pixel_mask=None,
+    interactive=False,
+    emit_3d=False,
+    save_overlays=False,
+    preset="balanced",
+    search_method="exact",
+    all_presets=False,
+):
+    started = time.perf_counter()
+    os.makedirs(output_dir, exist_ok=True)
+    centroid_dir = os.path.join(output_dir, "Centroid_Top")
+
+    signed, restored, _header, fits_stats = load_space_fits(fits_path, config=config)
+    raw_img = replace_bad_pixels(restored, bad_pixel_mask)
+    del signed, restored
+    print(f"[{os.path.basename(fits_path)}] shape={raw_img.shape}, min={raw_img.min():.1f}, max={raw_img.max():.1f}")
+    if fits_stats["fits_length"]["status"] == "pixel_data_complete_padding_missing":
+        print(
+            "注意：FITS 像素数据完整，仅缺少尾部 padding "
+            f"{fits_stats['fits_length']['missing_padding_bytes']} 字节。"
+        )
+
+    img_median = cv2.medianBlur(raw_img, ksize=3)
+    img_gaussian = cv2.GaussianBlur(img_median, ksize=(5, 5), sigmaX=1.0, sigmaY=1.0)
+    del img_median
+    mean_img = neighborhood_mean(img_gaussian, size=config.neighborhood_size)
+    background, sigma = robust_background(img_gaussian)
+
+    np.save(os.path.join(output_dir, "img_gaussian.npy"), img_gaussian)
+    np.save(os.path.join(output_dir, "I_D_raw.npy"), img_gaussian)
+    save_float_as_png_uint16(img_gaussian, os.path.join(output_dir, "img_gaussian.png"))
+    save_float_as_png_uint16(raw_img, os.path.join(output_dir, "raw_img.png"))
+
+    selected_preset = _validate_preset(preset, config)
+    selected_search = _normalize_search_method(search_method)
+    if all_presets:
+        preset_items = config.preset_percentiles.items()
+    else:
+        preset_items = ((selected_preset, config.preset_percentiles[selected_preset]),)
+
+    preset_stats = {}
+    production_mask = None
+    selected_threshold_s = None
+    selected_threshold_t = None
+    for preset_name, percentile in preset_items:
+        upper = choose_histogram_upper(
+            img_gaussian,
+            percentile,
+            background,
+            sigma,
+            min_upper_sigma=config.min_upper_sigma,
+        )
+        histogram, valid_pixels, excluded_pixels = build_binned_2d_histogram(
+            img_gaussian,
+            mean_img,
+            upper,
+            bins=config.hist_bins,
+            chunk_rows=config.hist_chunk_rows,
+        )
+        result = compare_searches(
+            preset_name,
+            percentile,
+            upper,
+            histogram,
+            valid_pixels,
+            excluded_pixels,
+            config,
+        )
+        exact_mask_u8 = apply_float_threshold(
+            img_gaussian,
+            mean_img,
+            result.exact_threshold_s,
+            result.exact_threshold_t,
+        )
+        nine_mask_u8 = apply_float_threshold(
+            img_gaussian,
+            mean_img,
+            result.nine_threshold_s,
+            result.nine_threshold_t,
+        )
+        difference_u8 = np.where(exact_mask_u8 != nine_mask_u8, 255, 0).astype(np.uint8)
+        component_stats = {
+            "exact": connected_component_metrics(exact_mask_u8),
+            "nine_grid": connected_component_metrics(nine_mask_u8),
+            "different_pixels": int(np.count_nonzero(difference_u8)),
+            "different_ratio": float(np.count_nonzero(difference_u8) / difference_u8.size),
+        }
+        if selected_search == "exact":
+            chosen_mask = exact_mask_u8
+            chosen_s = result.exact_threshold_s
+            chosen_t = result.exact_threshold_t
+        else:
+            chosen_mask = nine_mask_u8
+            chosen_s = result.nine_threshold_s
+            chosen_t = result.nine_threshold_t
+
+        preset_stats[preset_name] = _preset_to_dict(result, component_stats)
+        preset_stats[preset_name]["selected_search"] = selected_search
+        preset_stats[preset_name]["selected_threshold_s"] = chosen_s
+        preset_stats[preset_name]["selected_threshold_t"] = chosen_t
+        preset_stats[preset_name]["selected_components"] = component_stats[selected_search]
+        _remove_stale_search_artifacts(
+            output_dir, preset_name, selected_search
+        )
+        # Only the explicitly selected method is a production image artifact.
+        Image.fromarray(chosen_mask).save(
+            os.path.join(output_dir, f"mask_{preset_name}_{selected_search}.png")
+        )
+        # Compatibility alias follows the explicitly selected search method.
+        Image.fromarray(chosen_mask).save(os.path.join(output_dir, f"mask_{preset_name}.png"))
+        if preset_name == selected_preset:
+            production_mask = chosen_mask.copy()
+            selected_threshold_s = chosen_s
+            selected_threshold_t = chosen_t
+            Image.fromarray(chosen_mask).save(os.path.join(output_dir, "mask.png"))
+        save_histogram_2d(
+            histogram,
+            result.exact,
+            result.nine_grid,
+            os.path.join(output_dir, f"hist2d_{preset_name}.png"),
+            title=f"2-D Otsu histogram - {preset_name}",
+        )
+        if emit_3d and preset_name == selected_preset:
+            save_histogram_3d_safe(
+                histogram, os.path.join(output_dir, f"hist3d_{preset_name}.png")
+            )
+        if save_overlays:
+            _save_mask_overlay(
+                img_gaussian,
+                chosen_mask,
+                os.path.join(
+                    output_dir,
+                    f"overlay_{preset_name}_{selected_search}.png",
+                ),
+            )
+        print(
+            f"  {preset_name}: upper={upper:.3f}, "
+            f"exact=({result.exact_threshold_s:.3f}, {result.exact_threshold_t:.3f}), "
+            f"nine-grid=({result.nine_threshold_s:.3f}, {result.nine_threshold_t:.3f}), "
+            f"selected={selected_search}, "
+            f"unstable={result.nine_grid_unstable}"
+        )
+        if (
+            preset_name == selected_preset
+            and selected_search == "nine_grid"
+            and result.nine_grid_unstable
+        ):
+            print(
+                "  警告：所选九宫格结果与精确搜索差异超过稳定性标准；"
+                "仍按用户选择生成 mask.png 和质心表。"
+            )
+
+    if production_mask is None:
+        raise RuntimeError(f"未生成所选档位掩膜: {selected_preset}")
+    grayscale_centroids = calculate_grayscale_centroid(production_mask > 0, raw_img)
+    _save_centroid_artifacts(grayscale_centroids, centroid_dir)
+
+    stats = {
+        "source": os.path.abspath(fits_path),
+        "output_dir": os.path.abspath(output_dir),
+        "fits": fits_stats,
+        "bad_pixels_applied": int(np.count_nonzero(bad_pixel_mask)) if bad_pixel_mask is not None else 0,
+        "filtered": {
+            "min": float(img_gaussian.min()),
+            "max": float(img_gaussian.max()),
+            "background_median": background,
+            "background_sigma_mad": sigma,
+        },
+        "config": asdict(config),
+        "selected_preset": selected_preset,
+        "selected_search": selected_search,
+        "selected_threshold_s": selected_threshold_s,
+        "selected_threshold_t": selected_threshold_t,
+        "presets": preset_stats,
+        "centroid_count": len(grayscale_centroids),
+        "elapsed_seconds": float(time.perf_counter() - started),
+    }
+    with open(os.path.join(output_dir, "stats.json"), "w", encoding="utf-8") as stream:
+        json.dump(stats, stream, ensure_ascii=False, indent=2)
+
+    if interactive:
+        cv2.imshow(f"2D Otsu {selected_preset} / {selected_search}", production_mask)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+    return grayscale_centroids, stats
+
+
+def main_p1(
+    fits_path=None,
+    output_dir=None,
+    config=None,
+    bad_pixel_mask=None,
+    interactive=False,
+    emit_3d=False,
+    save_overlays=True,
+    preset="balanced",
+    search="exact",
+    all_presets=False,
+):
+    """Process one frame; ``preset`` and ``search`` drive mask.png and centroids."""
+    fits_path = fits_path or FITS_PATH
+    output_dir = output_dir or save_dir
+    config = config or SpaceOtsuConfig()
+    centroids, _ = _process_one(
+        fits_path,
+        output_dir,
+        config,
+        bad_pixel_mask=bad_pixel_mask,
+        interactive=interactive,
+        emit_3d=emit_3d,
+        save_overlays=save_overlays,
+        preset=preset,
+        search_method=search,
+        all_presets=all_presets,
     )
+    return centroids
 
-    return grayscale_centroids
 
-if __name__ == '__main__':
-    centroids = main_p1()
+def _save_bad_pixel_outputs(output_root, bad_mask, occurrence, frame_count):
+    np.save(os.path.join(output_root, "bad_pixel_mask.npy"), bad_mask)
+    Image.fromarray(bad_mask.astype(np.uint8) * 255).save(
+        os.path.join(output_root, "bad_pixel_mask.png")
+    )
+    coordinates = np.argwhere(occurrence > 0)
+    with open(os.path.join(output_root, "bad_pixel_candidates.csv"), "w", newline="", encoding="utf-8-sig") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(["y", "x", "occurrences", "persistence", "auto_repaired"])
+        for y, x in coordinates:
+            writer.writerow(
+                [
+                    int(y),
+                    int(x),
+                    int(occurrence[y, x]),
+                    float(occurrence[y, x] / frame_count),
+                    bool(bad_mask[y, x]),
+                ]
+            )
+
+
+def _batch_summary_rows(frame_index, stats):
+    rows = []
+    for preset_name, preset in stats["presets"].items():
+        rows.append(
+            {
+                "frame_index": frame_index,
+                "source": stats["source"],
+                "preset": preset_name,
+                "is_selected_preset": preset_name == stats["selected_preset"],
+                "selected_search": preset["selected_search"],
+                "background_median": stats["filtered"]["background_median"],
+                "background_sigma_mad": stats["filtered"]["background_sigma_mad"],
+                "histogram_upper": preset["upper"],
+                "exact_threshold_s": preset["exact_threshold_s"],
+                "exact_threshold_t": preset["exact_threshold_t"],
+                "nine_threshold_s": preset["nine_threshold_s"],
+                "nine_threshold_t": preset["nine_threshold_t"],
+                "selected_threshold_s": preset["selected_threshold_s"],
+                "selected_threshold_t": preset["selected_threshold_t"],
+                "exact_s_bin": preset["exact"]["s_bin"],
+                "exact_t_bin": preset["exact"]["t_bin"],
+                "exact_score": preset["exact"]["score"],
+                "exact_seconds": preset["exact"]["seconds"],
+                "nine_s_bin": preset["nine_grid"]["s_bin"],
+                "nine_t_bin": preset["nine_grid"]["t_bin"],
+                "nine_score": preset["nine_grid"]["score"],
+                "nine_seconds": preset["nine_grid"]["seconds"],
+                "score_gap": preset["score_gap"],
+                "bin_distance": preset["bin_distance"],
+                "nine_grid_unstable": preset["nine_grid_unstable"],
+                "different_pixels": preset["components"]["different_pixels"],
+                "different_ratio": preset["components"]["different_ratio"],
+                **{
+                    f"selected_{key}": value
+                    for key, value in preset["selected_components"].items()
+                },
+                **{
+                    f"exact_{key}": value
+                    for key, value in preset["components"]["exact"].items()
+                },
+                **{
+                    f"nine_{key}": value
+                    for key, value in preset["components"]["nine_grid"].items()
+                },
+            }
+        )
+    return rows
+
+
+def main_batch(
+    input_pattern,
+    output_root,
+    config=None,
+    emit_3d=False,
+    preset="balanced",
+    search="exact",
+    all_presets=False,
+):
+    """Process a batch; ``preset`` and ``search`` drive every mask.png and centroid table."""
+    config = config or SpaceOtsuConfig()
+    paths = sorted(glob.glob(input_pattern))
+    if not paths:
+        raise FileNotFoundError(f"没有匹配到 FITS: {input_pattern}")
+    os.makedirs(output_root, exist_ok=True)
+
+    def frame_factory():
+        for path in paths:
+            signed, restored, _, _ = load_space_fits(path, config=config)
+            yield signed, restored
+
+    print(f"使用 {len(paths)} 帧估计保守坏点掩膜……")
+    bad_mask, occurrence = estimate_persistent_bad_pixels(
+        frame_factory, len(paths), config
+    )
+    _save_bad_pixel_outputs(output_root, bad_mask, occurrence, len(paths))
+    print(f"自动修复坏点数: {int(bad_mask.sum())}")
+
+    summary_rows = []
+    all_centroids = []
+    for index, path in enumerate(paths, start=1):
+        frame_output = os.path.join(output_root, f"note_fits{index:02d}")
+        centroids, stats = _process_one(
+            path,
+            frame_output,
+            config,
+            bad_pixel_mask=bad_mask,
+            interactive=False,
+            emit_3d=emit_3d,
+            save_overlays=True,
+            preset=preset,
+            search_method=search,
+            all_presets=all_presets,
+        )
+        all_centroids.append(centroids)
+        summary_rows.extend(_batch_summary_rows(index, stats))
+
+    summary_path = os.path.join(output_root, "threshold_compare.csv")
+    with open(summary_path, "w", newline="", encoding="utf-8-sig") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(summary_rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(summary_rows)
+    return all_centroids
+
+
+def _build_arg_parser():
+    parser = argparse.ArgumentParser(description="天基星图固定分箱二维 Otsu 预处理")
+    parser.add_argument("--input", default=FITS_PATH, help="单个 FITS 路径或批处理通配符")
+    parser.add_argument("--output", default=None, help="单帧输出目录或批处理输出根目录")
+    parser.add_argument("--batch", action="store_true", help="按通配符执行批处理")
+    parser.add_argument("--signed", action="store_true", help="禁用本设备的 int16→uint16 按位恢复")
+    parser.add_argument("--interactive", action="store_true", help="单帧完成后显示所选掩膜")
+    parser.add_argument("--emit-3d", action="store_true", help="保存最多 64×64 柱体的安全 3D 图")
+    parser.add_argument(
+        "--preset",
+        choices=("balanced", "recall", "purity"),
+        default="balanced",
+        help="决定 mask.png 和质心表的灰度统计档位（默认 balanced）",
+    )
+    parser.add_argument(
+        "--search",
+        choices=("exact", "nine-grid"),
+        default="exact",
+        help="决定 mask.png 和质心表的阈值搜索方法（默认 exact）",
+    )
+    parser.add_argument(
+        "--all-presets",
+        action="store_true",
+        help="额外生成三种档位；未指定时只处理 --preset 所选档位",
+    )
+    return parser
+
+
+if __name__ == "__main__":
+    args = _build_arg_parser().parse_args()
+    runtime_config = replace(SpaceOtsuConfig(), reinterpret_unsigned=not args.signed)
+    wildcard_input = any(char in args.input for char in "*?[")
+    if args.batch or wildcard_input:
+        main_batch(
+            args.input,
+            args.output or "rst19",
+            config=runtime_config,
+            emit_3d=args.emit_3d,
+            preset=args.preset,
+            search=args.search,
+            all_presets=args.all_presets,
+        )
+    else:
+        main_p1(
+            args.input,
+            args.output or save_dir,
+            config=runtime_config,
+            interactive=args.interactive,
+            emit_3d=args.emit_3d,
+            preset=args.preset,
+            search=args.search,
+            all_presets=args.all_presets,
+        )
 
