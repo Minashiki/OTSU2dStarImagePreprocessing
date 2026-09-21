@@ -1,0 +1,13 @@
+# Runtime dependencies
+numpy>=1.23
+scipy>=1.9
+astropy>=5.0
+opencv-python>=4.7
+matplotlib>=3.6
+Pillow>=9.0
+pandas>=1.5
+PyYAML>=6.0
+tqdm>=4.64
+
+# Test runner
+pytest>=7.0
