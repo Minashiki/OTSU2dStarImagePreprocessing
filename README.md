@@ -1,4 +1,4 @@
-# OldStarImgPro
+# OTSU2d
 
 面向天基星图（FITS）的预处理与星点提取项目。项目的主流程使用固定分箱二维 Otsu 阈值分割，支持精确搜索和九宫格近似搜索，并可在批处理时识别、修复跨帧持续出现的孤立坏点。
 
@@ -18,13 +18,13 @@
 建议使用 Conda 隔离环境。以下命令在项目根目录执行：
 
 ```bash
-conda create -n oldstarimgpro python=3.10 -y
-conda activate oldstarimgpro
+conda create -n otsu2d python=3.10 -y
+conda activate otsu2d
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-项目依赖中包含 OpenCV、Astropy 和 SciPy；如 Conda 环境已配置镜像或使用 `conda-forge`，也可按本机规范安装这些包。运行代码前请确认已激活 `oldstarimgpro` 环境。
+项目依赖中包含 OpenCV、Astropy 和 SciPy；如 Conda 环境已配置镜像或使用 `conda-forge`，也可按本机规范安装这些包。运行代码前请确认已激活 `otsu2d` 环境。
 
 ## 快速开始
 
