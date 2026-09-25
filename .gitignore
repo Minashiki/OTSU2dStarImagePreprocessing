@@ -3,3 +3,6 @@
 /UtilityFunction/navigation_database.db
 /tests/
 __pycache__/
+/ImageData/
+/output/
+*.fits

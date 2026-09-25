@@ -3,6 +3,10 @@
 This module intentionally lives outside ``UtilityFunction``.  The legacy
 ground-based implementation uses a dense raw-gray-level histogram and is kept
 unchanged for reproducibility.
+
+When ``SpaceOtsuConfig.block_size`` is set, the filtered image is split into
+rectangular blocks before thresholding and every block runs its own fully
+independent 2-D Otsu search; incomplete edge blocks keep their true size.
 """
 
 from __future__ import annotations
@@ -46,6 +50,7 @@ class SpaceOtsuConfig:
     nine_grid_seed: int = 0
     unstable_score_gap: float = 0.01
     unstable_bin_distance: int = 4
+    block_size: tuple[int, int] | None = None
 
     def __post_init__(self) -> None:
         if self.hist_bins < 8:
@@ -56,6 +61,9 @@ class SpaceOtsuConfig:
             raise ValueError("neighborhood_size must be a positive odd number")
         if not 0 < self.bad_pixel_persistence <= 1:
             raise ValueError("bad_pixel_persistence must be in (0, 1]")
+        if self.block_size is not None:
+            if len(self.block_size) != 2 or min(self.block_size) < 1:
+                raise ValueError("block_size must be a (height, width) pair of positive integers")
 
 
 @dataclass(frozen=True)
@@ -419,6 +427,130 @@ def compare_searches(
         nine_threshold_s=bin_threshold_to_gray(nine.s_bin, upper, config.hist_bins),
         nine_threshold_t=bin_threshold_to_gray(nine.t_bin, upper, config.hist_bins),
     )
+
+
+def iter_block_slices(
+    shape: Sequence[int], block_size: tuple[int, int]
+) -> Iterator[tuple[int, int, slice, slice]]:
+    """Yield ``(block_row, block_col, y_slice, x_slice)`` for a regular grid.
+
+    Edge blocks keep their true smaller size; they are never padded.
+    """
+
+    rows, cols = int(shape[0]), int(shape[1])
+    block_h, block_w = int(block_size[0]), int(block_size[1])
+    if block_h < 1 or block_w < 1:
+        raise ValueError("block_size dimensions must be positive")
+    block_row = 0
+    for y0 in range(0, rows, block_h):
+        block_col = 0
+        for x0 in range(0, cols, block_w):
+            yield block_row, block_col, slice(y0, min(y0 + block_h, rows)), slice(
+                x0, min(x0 + block_w, cols)
+            )
+            block_col += 1
+        block_row += 1
+
+
+def block_grid_shape(shape: Sequence[int], block_size: tuple[int, int]) -> tuple[int, int]:
+    rows, cols = int(shape[0]), int(shape[1])
+    block_h, block_w = int(block_size[0]), int(block_size[1])
+    if block_h < 1 or block_w < 1:
+        raise ValueError("block_size dimensions must be positive")
+    return int(math.ceil(rows / block_h)), int(math.ceil(cols / block_w))
+
+
+@dataclass(frozen=True)
+class BlockResult:
+    block_row: int
+    block_col: int
+    y0: int
+    x0: int
+    height: int
+    width: int
+    upper: float
+    valid_pixels: int
+    excluded_pixels: int
+    preset: PresetResult
+
+
+def compare_searches_blocked(
+    image: np.ndarray,
+    mean_image: np.ndarray,
+    block_size: tuple[int, int],
+    preset_name: str,
+    percentile: float,
+    config: SpaceOtsuConfig,
+) -> tuple[list[BlockResult], np.ndarray, np.ndarray]:
+    """Run fully independent 2-D Otsu searches per rectangular block.
+
+    Each block gets its own background estimate, histogram upper bound,
+    threshold search and foreground/background split; blocks never share
+    information.  Returns the per-block results plus the stitched exact and
+    nine-grid masks at the full image size.
+    """
+
+    gray = np.asarray(image, dtype=np.float32)
+    mean = np.asarray(mean_image, dtype=np.float32)
+    if gray.shape != mean.shape or gray.ndim != 2:
+        raise ValueError("image and mean_image must be same-shaped 2-D arrays")
+    exact_mask = np.zeros(gray.shape, dtype=np.uint8)
+    nine_mask = np.zeros(gray.shape, dtype=np.uint8)
+    results: list[BlockResult] = []
+    for block_row, block_col, y_slice, x_slice in iter_block_slices(gray.shape, block_size):
+        block_img = gray[y_slice, x_slice]
+        block_mean = mean[y_slice, x_slice]
+        background, sigma = robust_background(block_img)
+        upper = choose_histogram_upper(
+            block_img,
+            percentile,
+            background,
+            sigma,
+            min_upper_sigma=config.min_upper_sigma,
+        )
+        histogram, valid_pixels, excluded_pixels = build_binned_2d_histogram(
+            block_img,
+            block_mean,
+            upper,
+            bins=config.hist_bins,
+            chunk_rows=config.hist_chunk_rows,
+        )
+        preset_result = compare_searches(
+            preset_name,
+            percentile,
+            upper,
+            histogram,
+            valid_pixels,
+            excluded_pixels,
+            config,
+        )
+        exact_mask[y_slice, x_slice] = apply_float_threshold(
+            block_img,
+            block_mean,
+            preset_result.exact_threshold_s,
+            preset_result.exact_threshold_t,
+        )
+        nine_mask[y_slice, x_slice] = apply_float_threshold(
+            block_img,
+            block_mean,
+            preset_result.nine_threshold_s,
+            preset_result.nine_threshold_t,
+        )
+        results.append(
+            BlockResult(
+                block_row=block_row,
+                block_col=block_col,
+                y0=int(y_slice.start),
+                x0=int(x_slice.start),
+                height=int(y_slice.stop - y_slice.start),
+                width=int(x_slice.stop - x_slice.start),
+                upper=float(upper),
+                valid_pixels=int(valid_pixels),
+                excluded_pixels=int(excluded_pixels),
+                preset=preset_result,
+            )
+        )
+    return results, exact_mask, nine_mask
 
 
 def apply_float_threshold(

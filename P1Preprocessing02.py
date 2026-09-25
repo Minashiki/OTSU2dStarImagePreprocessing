@@ -18,9 +18,11 @@ from UtilityFunction.calculate_centroid import calculate_grayscale_centroid
 from SpaceStarOtsu import (
     SpaceOtsuConfig,
     apply_float_threshold,
+    block_grid_shape,
     build_binned_2d_histogram,
     choose_histogram_upper,
     compare_searches,
+    compare_searches_blocked,
     connected_component_metrics,
     estimate_persistent_bad_pixels,
     neighborhood_mean,
@@ -126,6 +128,12 @@ def save_float_as_png_uint16(img_f32, save_path, lo_q=0.1, hi_q=99.9):
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     Image.fromarray(x16).save(save_path)
 
+def save_fits_image(data, save_path):
+    """Save the untouched pipeline array as FITS without any stretch or compression."""
+    os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+    fits.writeto(save_path, np.asarray(data), overwrite=True)
+
+
 def save_centroids_to_csv(centroids, output_dir):
     """Save ``(x, y)`` centroid pairs as NumPy and CSV files."""
     save_path_npy = os.path.join(output_dir, "centroids.npy")
@@ -188,7 +196,7 @@ def _save_centroid_artifacts(grayscale_centroids, output_dir):
     np.savez_compressed(os.path.join(output_dir, "centroid_top.npz"), top_hash=top_hash)
 
 
-def _save_mask_overlay(image, mask_u8, save_path):
+def _save_mask_overlay(image, mask_u8, save_path, save_fits=False):
     finite = image[np.isfinite(image)]
     lo, hi = np.percentile(finite, [1.0, 99.9])
     display = np.clip((image - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
@@ -197,6 +205,12 @@ def _save_mask_overlay(image, mask_u8, save_path):
     contours, _ = cv2.findContours((mask_u8 > 0).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     cv2.drawContours(overlay, contours, -1, (0, 0, 255), 1)
     cv2.imwrite(save_path, overlay)
+    if save_fits:
+        # FITS keeps the same BGR overlay content, stored channel-first (NAXIS3=3).
+        save_fits_image(
+            np.moveaxis(overlay, -1, 0),
+            os.path.splitext(save_path)[0] + ".fits",
+        )
 
 
 def _remove_stale_search_artifacts(output_dir, preset_name, selected_search):
@@ -206,6 +220,9 @@ def _remove_stale_search_artifacts(output_dir, preset_name, selected_search):
         f"mask_{preset_name}_{other_search}.png",
         f"overlay_{preset_name}_{other_search}.png",
         f"mask_{preset_name}_difference.png",
+        f"mask_{preset_name}_{other_search}.fits",
+        f"overlay_{preset_name}_{other_search}.fits",
+        f"mask_{preset_name}_difference.fits",
     )
     for name in stale_names:
         path = os.path.join(output_dir, name)
@@ -232,13 +249,129 @@ def _preset_to_dict(result, component_stats):
     }
 
 
+def _parse_block_size(text):
+    """Parse ``--block-size`` values like ``50`` or ``50x80`` into ``(h, w)``."""
+    if text is None:
+        return None
+    normalized = str(text).strip().lower().replace("*", "x")
+    parts = normalized.split("x")
+    if len(parts) == 1:
+        parts = parts * 2
+    if len(parts) != 2:
+        raise ValueError("--block-size 格式应为 '50' 或 '50x80'")
+    try:
+        block_h, block_w = (int(part) for part in parts)
+    except ValueError:
+        raise ValueError("--block-size 必须是正整数") from None
+    if block_h < 1 or block_w < 1:
+        raise ValueError("--block-size 必须是正整数")
+    return (block_h, block_w)
+
+
+def _mean(values):
+    values = list(values)
+    return float(np.mean(values)) if values else float("nan")
+
+
+def _search_block_summary(block_results, search_attr):
+    searches = [getattr(block.preset, search_attr) for block in block_results]
+    return {
+        "s_bin": _mean(search.s_bin for search in searches),
+        "t_bin": _mean(search.t_bin for search in searches),
+        "score": _mean(search.score for search in searches),
+        "evaluations": int(sum(search.evaluations for search in searches)),
+        "seconds": float(sum(search.seconds for search in searches)),
+        "aggregation": "mean over blocks (evaluations/seconds are sums)",
+    }
+
+
+def _block_preset_to_dict(block_results, block_size, image_shape, component_stats):
+    presets = [block.preset for block in block_results]
+    unstable_count = int(sum(preset.nine_grid_unstable for preset in presets))
+    return {
+        "block_mode": True,
+        "block_size": [int(block_size[0]), int(block_size[1])],
+        "grid_shape": list(block_grid_shape(image_shape, block_size)),
+        "block_count": len(block_results),
+        "percentile": float(presets[0].percentile),
+        "upper": _mean(preset.upper for preset in presets),
+        "upper_min": float(min(preset.upper for preset in presets)),
+        "upper_max": float(max(preset.upper for preset in presets)),
+        "valid_pixels": int(sum(preset.valid_pixels for preset in presets)),
+        "excluded_pixels": int(sum(preset.excluded_pixels for preset in presets)),
+        "exact": _search_block_summary(block_results, "exact"),
+        "nine_grid": _search_block_summary(block_results, "nine_grid"),
+        "score_gap": _mean(preset.score_gap for preset in presets),
+        "bin_distance": _mean(preset.bin_distance for preset in presets),
+        "nine_grid_unstable": unstable_count > 0,
+        "nine_grid_unstable_blocks": unstable_count,
+        "exact_threshold_s": _mean(preset.exact_threshold_s for preset in presets),
+        "exact_threshold_t": _mean(preset.exact_threshold_t for preset in presets),
+        "nine_threshold_s": _mean(preset.nine_threshold_s for preset in presets),
+        "nine_threshold_t": _mean(preset.nine_threshold_t for preset in presets),
+        "components": component_stats,
+        "aggregation": "threshold/score fields are means over independent blocks",
+    }
+
+
+def _save_block_csv(block_results, output_dir, preset_name):
+    save_path = os.path.join(output_dir, f"blocks_{preset_name}.csv")
+    with open(save_path, "w", newline="", encoding="utf-8-sig") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(
+            [
+                "block_row", "block_col", "y0", "x0", "height", "width",
+                "upper", "valid_pixels", "excluded_pixels",
+                "exact_s_bin", "exact_t_bin", "exact_threshold_s", "exact_threshold_t",
+                "exact_score", "exact_seconds",
+                "nine_s_bin", "nine_t_bin", "nine_threshold_s", "nine_threshold_t",
+                "nine_score", "nine_seconds",
+                "score_gap", "bin_distance", "nine_grid_unstable",
+            ]
+        )
+        for block in block_results:
+            preset = block.preset
+            writer.writerow(
+                [
+                    block.block_row, block.block_col, block.y0, block.x0,
+                    block.height, block.width,
+                    block.upper, block.valid_pixels, block.excluded_pixels,
+                    preset.exact.s_bin, preset.exact.t_bin,
+                    preset.exact_threshold_s, preset.exact_threshold_t,
+                    preset.exact.score, preset.exact.seconds,
+                    preset.nine_grid.s_bin, preset.nine_grid.t_bin,
+                    preset.nine_threshold_s, preset.nine_threshold_t,
+                    preset.nine_grid.score, preset.nine_grid.seconds,
+                    preset.score_gap, preset.bin_distance, preset.nine_grid_unstable,
+                ]
+            )
+
+
+def _save_block_threshold_maps(block_results, block_size, image_shape, output_dir, preset_name, selected_search, save_fits=False):
+    grid_rows, grid_cols = block_grid_shape(image_shape, block_size)
+    s_map = np.full((grid_rows, grid_cols), np.nan, dtype=np.float32)
+    t_map = np.full((grid_rows, grid_cols), np.nan, dtype=np.float32)
+    for block in block_results:
+        preset = block.preset
+        if selected_search == "exact":
+            s_map[block.block_row, block.block_col] = preset.exact_threshold_s
+            t_map[block.block_row, block.block_col] = preset.exact_threshold_t
+        else:
+            s_map[block.block_row, block.block_col] = preset.nine_threshold_s
+            t_map[block.block_row, block.block_col] = preset.nine_threshold_t
+    for label, threshold_map in (("s", s_map), ("t", t_map)):
+        base = f"block_threshold_{label}_{preset_name}_{selected_search}"
+        np.save(os.path.join(output_dir, f"{base}.npy"), threshold_map)
+        save_float_as_png_uint16(threshold_map, os.path.join(output_dir, f"{base}.png"))
+        if save_fits:
+            save_fits_image(threshold_map, os.path.join(output_dir, f"{base}.fits"))
+
+
 def _normalize_search_method(search_method):
     normalized = str(search_method).strip().lower().replace("-", "_")
     if normalized not in {"exact", "nine_grid"}:
         raise ValueError("search_method 必须是 'exact' 或 'nine-grid'")
     return normalized
-
-
 def _validate_preset(preset, config):
     normalized = str(preset).strip().lower()
     if normalized not in config.preset_percentiles:
@@ -258,6 +391,7 @@ def _process_one(
     preset="balanced",
     search_method="exact",
     all_presets=False,
+    save_fits=False,
 ):
     started = time.perf_counter()
     os.makedirs(output_dir, exist_ok=True)
@@ -283,6 +417,10 @@ def _process_one(
     np.save(os.path.join(output_dir, "I_D_raw.npy"), img_gaussian)
     save_float_as_png_uint16(img_gaussian, os.path.join(output_dir, "img_gaussian.png"))
     save_float_as_png_uint16(raw_img, os.path.join(output_dir, "raw_img.png"))
+    if save_fits:
+        # FITS keeps the exact float32 arrays used downstream (histogram input etc.).
+        save_fits_image(img_gaussian, os.path.join(output_dir, "img_gaussian.fits"))
+        save_fits_image(raw_img, os.path.join(output_dir, "raw_img.fits"))
 
     selected_preset = _validate_preset(preset, config)
     selected_search = _normalize_search_method(search_method)
@@ -296,41 +434,53 @@ def _process_one(
     selected_threshold_s = None
     selected_threshold_t = None
     for preset_name, percentile in preset_items:
-        upper = choose_histogram_upper(
-            img_gaussian,
-            percentile,
-            background,
-            sigma,
-            min_upper_sigma=config.min_upper_sigma,
-        )
-        histogram, valid_pixels, excluded_pixels = build_binned_2d_histogram(
-            img_gaussian,
-            mean_img,
-            upper,
-            bins=config.hist_bins,
-            chunk_rows=config.hist_chunk_rows,
-        )
-        result = compare_searches(
-            preset_name,
-            percentile,
-            upper,
-            histogram,
-            valid_pixels,
-            excluded_pixels,
-            config,
-        )
-        exact_mask_u8 = apply_float_threshold(
-            img_gaussian,
-            mean_img,
-            result.exact_threshold_s,
-            result.exact_threshold_t,
-        )
-        nine_mask_u8 = apply_float_threshold(
-            img_gaussian,
-            mean_img,
-            result.nine_threshold_s,
-            result.nine_threshold_t,
-        )
+        result = None
+        block_results = None
+        if config.block_size is None:
+            upper = choose_histogram_upper(
+                img_gaussian,
+                percentile,
+                background,
+                sigma,
+                min_upper_sigma=config.min_upper_sigma,
+            )
+            histogram, valid_pixels, excluded_pixels = build_binned_2d_histogram(
+                img_gaussian,
+                mean_img,
+                upper,
+                bins=config.hist_bins,
+                chunk_rows=config.hist_chunk_rows,
+            )
+            result = compare_searches(
+                preset_name,
+                percentile,
+                upper,
+                histogram,
+                valid_pixels,
+                excluded_pixels,
+                config,
+            )
+            exact_mask_u8 = apply_float_threshold(
+                img_gaussian,
+                mean_img,
+                result.exact_threshold_s,
+                result.exact_threshold_t,
+            )
+            nine_mask_u8 = apply_float_threshold(
+                img_gaussian,
+                mean_img,
+                result.nine_threshold_s,
+                result.nine_threshold_t,
+            )
+        else:
+            block_results, exact_mask_u8, nine_mask_u8 = compare_searches_blocked(
+                img_gaussian,
+                mean_img,
+                config.block_size,
+                preset_name,
+                percentile,
+                config,
+            )
         difference_u8 = np.where(exact_mask_u8 != nine_mask_u8, 255, 0).astype(np.uint8)
         component_stats = {
             "exact": connected_component_metrics(exact_mask_u8),
@@ -340,14 +490,37 @@ def _process_one(
         }
         if selected_search == "exact":
             chosen_mask = exact_mask_u8
-            chosen_s = result.exact_threshold_s
-            chosen_t = result.exact_threshold_t
         else:
             chosen_mask = nine_mask_u8
-            chosen_s = result.nine_threshold_s
-            chosen_t = result.nine_threshold_t
-
-        preset_stats[preset_name] = _preset_to_dict(result, component_stats)
+        if block_results is None:
+            chosen_s = (
+                result.exact_threshold_s
+                if selected_search == "exact"
+                else result.nine_threshold_s
+            )
+            chosen_t = (
+                result.exact_threshold_t
+                if selected_search == "exact"
+                else result.nine_threshold_t
+            )
+            preset_stats[preset_name] = _preset_to_dict(result, component_stats)
+        else:
+            # Thresholds are per-block; the scalar slots stay empty in block mode.
+            chosen_s = None
+            chosen_t = None
+            preset_stats[preset_name] = _block_preset_to_dict(
+                block_results, config.block_size, img_gaussian.shape, component_stats
+            )
+            _save_block_csv(block_results, output_dir, preset_name)
+            _save_block_threshold_maps(
+                block_results,
+                config.block_size,
+                img_gaussian.shape,
+                output_dir,
+                preset_name,
+                selected_search,
+                save_fits=save_fits,
+            )
         preset_stats[preset_name]["selected_search"] = selected_search
         preset_stats[preset_name]["selected_threshold_s"] = chosen_s
         preset_stats[preset_name]["selected_threshold_t"] = chosen_t
@@ -361,22 +534,31 @@ def _process_one(
         )
         # Compatibility alias follows the explicitly selected search method.
         Image.fromarray(chosen_mask).save(os.path.join(output_dir, f"mask_{preset_name}.png"))
+        if save_fits:
+            save_fits_image(
+                chosen_mask,
+                os.path.join(output_dir, f"mask_{preset_name}_{selected_search}.fits"),
+            )
+            save_fits_image(chosen_mask, os.path.join(output_dir, f"mask_{preset_name}.fits"))
         if preset_name == selected_preset:
             production_mask = chosen_mask.copy()
             selected_threshold_s = chosen_s
             selected_threshold_t = chosen_t
             Image.fromarray(chosen_mask).save(os.path.join(output_dir, "mask.png"))
-        save_histogram_2d(
-            histogram,
-            result.exact,
-            result.nine_grid,
-            os.path.join(output_dir, f"hist2d_{preset_name}.png"),
-            title=f"2-D Otsu histogram - {preset_name}",
-        )
-        if emit_3d and preset_name == selected_preset:
-            save_histogram_3d_safe(
-                histogram, os.path.join(output_dir, f"hist3d_{preset_name}.png")
+            if save_fits:
+                save_fits_image(chosen_mask, os.path.join(output_dir, "mask.fits"))
+        if block_results is None:
+            save_histogram_2d(
+                histogram,
+                result.exact,
+                result.nine_grid,
+                os.path.join(output_dir, f"hist2d_{preset_name}.png"),
+                title=f"2-D Otsu histogram - {preset_name}",
             )
+            if emit_3d and preset_name == selected_preset:
+                save_histogram_3d_safe(
+                    histogram, os.path.join(output_dir, f"hist3d_{preset_name}.png")
+                )
         if save_overlays:
             _save_mask_overlay(
                 img_gaussian,
@@ -385,18 +567,37 @@ def _process_one(
                     output_dir,
                     f"overlay_{preset_name}_{selected_search}.png",
                 ),
+                save_fits=save_fits,
             )
-        print(
-            f"  {preset_name}: upper={upper:.3f}, "
-            f"exact=({result.exact_threshold_s:.3f}, {result.exact_threshold_t:.3f}), "
-            f"nine-grid=({result.nine_threshold_s:.3f}, {result.nine_threshold_t:.3f}), "
-            f"selected={selected_search}, "
-            f"unstable={result.nine_grid_unstable}"
+        if block_results is None:
+            print(
+                f"  {preset_name}: upper={upper:.3f}, "
+                f"exact=({result.exact_threshold_s:.3f}, {result.exact_threshold_t:.3f}), "
+                f"nine-grid=({result.nine_threshold_s:.3f}, {result.nine_threshold_t:.3f}), "
+                f"selected={selected_search}, "
+                f"unstable={result.nine_grid_unstable}"
+            )
+        else:
+            block_summary = preset_stats[preset_name]
+            print(
+                f"  {preset_name}: blocks={len(block_results)} "
+                f"(grid={block_summary['grid_shape'][0]}x{block_summary['grid_shape'][1]}), "
+                f"exact_mean=({block_summary['exact_threshold_s']:.3f}, "
+                f"{block_summary['exact_threshold_t']:.3f}), "
+                f"nine-grid_mean=({block_summary['nine_threshold_s']:.3f}, "
+                f"{block_summary['nine_threshold_t']:.3f}), "
+                f"selected={selected_search}, "
+                f"unstable_blocks={block_summary['nine_grid_unstable_blocks']}"
+            )
+        nine_grid_unstable = (
+            result.nine_grid_unstable
+            if block_results is None
+            else preset_stats[preset_name]["nine_grid_unstable"]
         )
         if (
             preset_name == selected_preset
             and selected_search == "nine_grid"
-            and result.nine_grid_unstable
+            and nine_grid_unstable
         ):
             print(
                 "  警告：所选九宫格结果与精确搜索差异超过稳定性标准；"
@@ -420,6 +621,7 @@ def _process_one(
             "background_sigma_mad": sigma,
         },
         "config": asdict(config),
+        "block_mode": config.block_size is not None,
         "selected_preset": selected_preset,
         "selected_search": selected_search,
         "selected_threshold_s": selected_threshold_s,
@@ -449,6 +651,7 @@ def main_p1(
     preset="balanced",
     search="exact",
     all_presets=False,
+    save_fits=False,
 ):
     """Process one frame; ``preset`` and ``search`` drive mask.png and centroids."""
     fits_path = fits_path or FITS_PATH
@@ -465,6 +668,7 @@ def main_p1(
         preset=preset,
         search_method=search,
         all_presets=all_presets,
+        save_fits=save_fits,
     )
     return centroids
 
@@ -547,6 +751,7 @@ def main_batch(
     preset="balanced",
     search="exact",
     all_presets=False,
+    save_fits=False,
 ):
     """Process a batch; ``preset`` and ``search`` drive every mask.png and centroid table."""
     config = config or SpaceOtsuConfig()
@@ -582,6 +787,7 @@ def main_batch(
             preset=preset,
             search_method=search,
             all_presets=all_presets,
+            save_fits=save_fits,
         )
         all_centroids.append(centroids)
         summary_rows.extend(_batch_summary_rows(index, stats))
@@ -619,12 +825,34 @@ def _build_arg_parser():
         action="store_true",
         help="额外生成三种档位；未指定时只处理 --preset 所选档位",
     )
+    parser.add_argument(
+        "--block-size",
+        default=None,
+        metavar="H[xW]",
+        help="可选分块大小，如 50 或 50x80；设置后滤波图像被切分为独立矩形块分别做二维 Otsu，"
+        "边界不足一块时保持原样不补全；未指定时保持整幅处理",
+    )
+    parser.add_argument(
+        "--save-fits",
+        action="store_true",
+        help="额外把各 PNG 对应的管线原始数组保存为 FITS（无分位数裁剪与拉伸，"
+        "如 img_gaussian.fits 与建立直方图的数据完全一致），便于与原生 FITS 对比审查",
+    )
     return parser
 
 
 if __name__ == "__main__":
-    args = _build_arg_parser().parse_args()
-    runtime_config = replace(SpaceOtsuConfig(), reinterpret_unsigned=not args.signed)
+    parser = _build_arg_parser()
+    args = parser.parse_args()
+    try:
+        block_size = _parse_block_size(args.block_size)
+    except ValueError as exc:
+        parser.error(str(exc))
+    runtime_config = replace(
+        SpaceOtsuConfig(),
+        reinterpret_unsigned=not args.signed,
+        block_size=block_size,
+    )
     wildcard_input = any(char in args.input for char in "*?[")
     if args.batch or wildcard_input:
         main_batch(
@@ -635,6 +863,7 @@ if __name__ == "__main__":
             preset=args.preset,
             search=args.search,
             all_presets=args.all_presets,
+            save_fits=args.save_fits,
         )
     else:
         main_p1(
@@ -646,5 +875,6 @@ if __name__ == "__main__":
             preset=args.preset,
             search=args.search,
             all_presets=args.all_presets,
+            save_fits=args.save_fits,
         )
 
