@@ -410,7 +410,12 @@ def _process_one(
     img_median = cv2.medianBlur(raw_img, ksize=3)
     img_gaussian = cv2.GaussianBlur(img_median, ksize=(5, 5), sigmaX=1.0, sigmaY=1.0)
     del img_median
+    if config.gray_scaling == "clip":
+        np.clip(img_gaussian, config.gray_lower, config.gray_upper, out=img_gaussian)
     mean_img = neighborhood_mean(img_gaussian, size=config.neighborhood_size)
+    if config.gray_scaling == "clip":
+        # Keep floating-point neighborhood means inside the histogram bounds.
+        np.clip(mean_img, config.gray_lower, config.gray_upper, out=mean_img)
     background, sigma = robust_background(img_gaussian)
 
     np.save(os.path.join(output_dir, "img_gaussian.npy"), img_gaussian)
@@ -437,19 +442,24 @@ def _process_one(
         result = None
         block_results = None
         if config.block_size is None:
-            upper = choose_histogram_upper(
-                img_gaussian,
-                percentile,
-                background,
-                sigma,
-                min_upper_sigma=config.min_upper_sigma,
-            )
+            lower = config.gray_lower if config.gray_scaling == "clip" else 0.0
+            if config.gray_scaling == "clip":
+                upper = config.gray_upper
+            else:
+                upper = choose_histogram_upper(
+                    img_gaussian,
+                    percentile,
+                    background,
+                    sigma,
+                    min_upper_sigma=config.min_upper_sigma,
+                )
             histogram, valid_pixels, excluded_pixels = build_binned_2d_histogram(
                 img_gaussian,
                 mean_img,
                 upper,
                 bins=config.hist_bins,
                 chunk_rows=config.hist_chunk_rows,
+                lower=lower,
             )
             result = compare_searches(
                 preset_name,
@@ -606,6 +616,13 @@ def _process_one(
 
     if production_mask is None:
         raise RuntimeError(f"未生成所选档位掩膜: {selected_preset}")
+
+    # clean_star: 生产掩膜的前景保留原始灰度、背景置 0，作为后续动目标识别的输入。
+    clean_star = np.where(production_mask > 0, raw_img, 0).astype(np.float32)
+    save_float_as_png_uint16(clean_star, os.path.join(output_dir, "clean_star.png"))
+    # FITS 无条件保存：内容是未拉伸的原始 clean_star 数组，供动目标识别直接读取。
+    save_fits_image(clean_star, os.path.join(output_dir, "clean_star.fits"))
+
     grayscale_centroids = calculate_grayscale_centroid(production_mask > 0, raw_img)
     _save_centroid_artifacts(grayscale_centroids, centroid_dir)
 
@@ -815,6 +832,20 @@ def _build_arg_parser():
         help="决定 mask.png 和质心表的灰度统计档位（默认 balanced）",
     )
     parser.add_argument(
+        "--gray-scaling",
+        choices=("preset", "clip"),
+        default="preset",
+        help="灰度范围方式：preset 使用现有档位（默认）；clip 在滤波后按固定上下限截断",
+    )
+    parser.add_argument(
+        "--gray-lower", type=float, default=0.0,
+        help="clip 方式的灰度下限（默认 0；须小于上限）",
+    )
+    parser.add_argument(
+        "--gray-upper", type=float, default=255.0,
+        help="clip 方式的灰度上限（默认 255）",
+    )
+    parser.add_argument(
         "--search",
         choices=("exact", "nine-grid"),
         default="exact",
@@ -846,13 +877,16 @@ if __name__ == "__main__":
     args = parser.parse_args()
     try:
         block_size = _parse_block_size(args.block_size)
+        runtime_config = replace(
+            SpaceOtsuConfig(),
+            reinterpret_unsigned=not args.signed,
+            block_size=block_size,
+            gray_scaling=args.gray_scaling,
+            gray_lower=args.gray_lower,
+            gray_upper=args.gray_upper,
+        )
     except ValueError as exc:
         parser.error(str(exc))
-    runtime_config = replace(
-        SpaceOtsuConfig(),
-        reinterpret_unsigned=not args.signed,
-        block_size=block_size,
-    )
     wildcard_input = any(char in args.input for char in "*?[")
     if args.batch or wildcard_input:
         main_batch(

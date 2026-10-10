@@ -51,6 +51,9 @@ class SpaceOtsuConfig:
     unstable_score_gap: float = 0.01
     unstable_bin_distance: int = 4
     block_size: tuple[int, int] | None = None
+    gray_scaling: str = "preset"
+    gray_lower: float = 0.0
+    gray_upper: float = 255.0
 
     def __post_init__(self) -> None:
         if self.hist_bins < 8:
@@ -64,6 +67,13 @@ class SpaceOtsuConfig:
         if self.block_size is not None:
             if len(self.block_size) != 2 or min(self.block_size) < 1:
                 raise ValueError("block_size must be a (height, width) pair of positive integers")
+        if self.gray_scaling not in {"preset", "clip"}:
+            raise ValueError("gray_scaling must be 'preset' or 'clip'")
+        if self.gray_scaling == "clip":
+            if not np.isfinite(self.gray_lower) or not np.isfinite(self.gray_upper):
+                raise ValueError("gray_lower and gray_upper must be finite")
+            if self.gray_lower >= self.gray_upper:
+                raise ValueError("gray_lower must be smaller than gray_upper")
 
 
 @dataclass(frozen=True)
@@ -275,28 +285,29 @@ def build_binned_2d_histogram(
     upper: float,
     bins: int = 256,
     chunk_rows: int = 256,
+    lower: float = 0.0,
 ) -> tuple[np.ndarray, int, int]:
-    """Build a fixed-size histogram while excluding the high-gray search tail."""
+    """Build a fixed-size histogram over the inclusive gray search range."""
 
     gray = np.asarray(image, dtype=np.float32)
     mean = np.asarray(mean_image, dtype=np.float32)
     if gray.shape != mean.shape or gray.ndim != 2:
         raise ValueError("image and mean_image must be same-shaped 2-D arrays")
-    if upper <= 0 or bins < 2:
-        raise ValueError("upper and bins must be positive")
+    if not np.isfinite(lower) or not np.isfinite(upper) or upper <= lower or bins < 2:
+        raise ValueError("histogram bounds must be finite with lower < upper, and bins >= 2")
     counts = np.zeros(bins * bins, dtype=np.uint64)
     valid_total = 0
-    scale = bins / float(upper)
+    scale = bins / float(upper - lower)
     for row_start in range(0, gray.shape[0], chunk_rows):
         row_end = min(row_start + chunk_rows, gray.shape[0])
         g = gray[row_start:row_end]
         m = mean[row_start:row_end]
         valid = np.isfinite(g) & np.isfinite(m)
-        valid &= (g >= 0.0) & (m >= 0.0) & (g <= upper) & (m <= upper)
+        valid &= (g >= lower) & (m >= lower) & (g <= upper) & (m <= upper)
         if not np.any(valid):
             continue
-        g_bin = np.minimum((g[valid] * scale).astype(np.int32), bins - 1)
-        m_bin = np.minimum((m[valid] * scale).astype(np.int32), bins - 1)
+        g_bin = np.minimum(((g[valid] - lower) * scale).astype(np.int32), bins - 1)
+        m_bin = np.minimum(((m[valid] - lower) * scale).astype(np.int32), bins - 1)
         flat = g_bin * bins + m_bin
         counts += np.bincount(flat, minlength=bins * bins).astype(np.uint64)
         valid_total += int(flat.size)
@@ -385,10 +396,12 @@ def nine_grid_threshold_search(
     )
 
 
-def bin_threshold_to_gray(bin_index: int, upper: float, bins: int) -> float:
+def bin_threshold_to_gray(
+    bin_index: int, upper: float, bins: int, lower: float = 0.0
+) -> float:
     if not 0 <= bin_index < bins - 1:
         raise ValueError("bin_index must be in [0, bins - 2]")
-    return float((bin_index + 1) * upper / bins)
+    return float(lower + (bin_index + 1) * (upper - lower) / bins)
 
 
 def compare_searches(
@@ -411,6 +424,7 @@ def compare_searches(
     score_gap = max(0.0, (exact.score - nine.score) / max(abs(exact.score), 1e-12))
     bin_distance = max(abs(exact.s_bin - nine.s_bin), abs(exact.t_bin - nine.t_bin))
     unstable = score_gap > config.unstable_score_gap or bin_distance > config.unstable_bin_distance
+    lower = config.gray_lower if config.gray_scaling == "clip" else 0.0
     return PresetResult(
         name=name,
         percentile=float(percentile),
@@ -422,10 +436,10 @@ def compare_searches(
         score_gap=float(score_gap),
         bin_distance=int(bin_distance),
         nine_grid_unstable=bool(unstable),
-        exact_threshold_s=bin_threshold_to_gray(exact.s_bin, upper, config.hist_bins),
-        exact_threshold_t=bin_threshold_to_gray(exact.t_bin, upper, config.hist_bins),
-        nine_threshold_s=bin_threshold_to_gray(nine.s_bin, upper, config.hist_bins),
-        nine_threshold_t=bin_threshold_to_gray(nine.t_bin, upper, config.hist_bins),
+        exact_threshold_s=bin_threshold_to_gray(exact.s_bin, upper, config.hist_bins, lower),
+        exact_threshold_t=bin_threshold_to_gray(exact.t_bin, upper, config.hist_bins, lower),
+        nine_threshold_s=bin_threshold_to_gray(nine.s_bin, upper, config.hist_bins, lower),
+        nine_threshold_t=bin_threshold_to_gray(nine.t_bin, upper, config.hist_bins, lower),
     )
 
 
@@ -484,9 +498,9 @@ def compare_searches_blocked(
 ) -> tuple[list[BlockResult], np.ndarray, np.ndarray]:
     """Run fully independent 2-D Otsu searches per rectangular block.
 
-    Each block gets its own background estimate, histogram upper bound,
-    threshold search and foreground/background split; blocks never share
-    information.  Returns the per-block results plus the stitched exact and
+    Each block gets its own threshold search and foreground/background split.
+    Preset mode estimates each block's background and histogram upper bound;
+    clip mode uses fixed bounds.  Returns the per-block results plus the stitched exact and
     nine-grid masks at the full image size.
     """
 
@@ -500,20 +514,25 @@ def compare_searches_blocked(
     for block_row, block_col, y_slice, x_slice in iter_block_slices(gray.shape, block_size):
         block_img = gray[y_slice, x_slice]
         block_mean = mean[y_slice, x_slice]
-        background, sigma = robust_background(block_img)
-        upper = choose_histogram_upper(
-            block_img,
-            percentile,
-            background,
-            sigma,
-            min_upper_sigma=config.min_upper_sigma,
-        )
+        lower = config.gray_lower if config.gray_scaling == "clip" else 0.0
+        if config.gray_scaling == "clip":
+            upper = config.gray_upper
+        else:
+            background, sigma = robust_background(block_img)
+            upper = choose_histogram_upper(
+                block_img,
+                percentile,
+                background,
+                sigma,
+                min_upper_sigma=config.min_upper_sigma,
+            )
         histogram, valid_pixels, excluded_pixels = build_binned_2d_histogram(
             block_img,
             block_mean,
             upper,
             bins=config.hist_bins,
             chunk_rows=config.hist_chunk_rows,
+            lower=lower,
         )
         preset_result = compare_searches(
             preset_name,
